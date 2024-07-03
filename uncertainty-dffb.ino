@@ -1,14 +1,15 @@
 #include <Arduino.h>
 #include <math.h>
 #include <vector>
-#include <list>
 #include "hardware/gpio.h"
 #include "pico/stdlib.h"
+#include "pico/multicore.h"
 #include "hardware/adc.h"
 
 #define SAMPLE_RATE (10000.0)
 #define TIMER_INTERVAL ((int)(1000000.0/SAMPLE_RATE))
 #define MAX_SAMPLES 3
+#define SECTION_LENGTH 6
 
 // number of gate outs
 #define NUM_GATES 8
@@ -22,54 +23,79 @@ int inputPin = 26;
 
 double debugVal = -50;
 
+class RingBuffer {
+private:
+  double _data[MAX_SAMPLES];
+  int _start = 0;
+  int _size = 0;
+
+public:
+  RingBuffer() {}
+
+  double operator[](int index) const {
+    return _data[(_start + index) % MAX_SAMPLES];
+  }
+
+  void put(const double& value) {
+    if (_size < MAX_SAMPLES) {
+      _data[(_start + _size) % MAX_SAMPLES] = value;
+      _size += 1;
+    }
+    else {
+      _data[_start] = value;
+      _start = (_start + 1) % MAX_SAMPLES;
+    }
+  }
+};
+
 class IIRFilter {
 private:
-  int _stages;
-  vector<vector<double>> _sos;
-
-  vector<list<double>> _feedbackSamples;
   bool _debug = false;
+  int _stages;
+  double* _sos;
+  RingBuffer* _feedbackSamples;
 
 public:
   IIRFilter(vector<vector<double>> sos, bool debug = false) {
-    _sos = std::move(sos);
-    _stages = _sos.size();
-    // initialize feedback lists for each stage
+    _stages = sos.size();
+    _feedbackSamples = new RingBuffer[_stages];
+    _sos = new double[_stages * SECTION_LENGTH]();
     for (int i=0; i<_stages; i++) {
-      _feedbackSamples.push_back(list<double>());
+      for (int j=0; j<6; j++) {
+        _sos[SECTION_LENGTH * i + j] = sos[i][j];
+      }
     }
     _debug = debug;
   }
 
-  double Process(const list<double>& samples) {
+  double Process(const RingBuffer& samples) {
     double value;
     for (int stage=0; stage<_stages; stage++) {
-      vector<double> section = _sos[stage];
-      const list<double>& input = (stage == 0) ? samples : _feedbackSamples[stage-1];
-      list<double>& feedback = _feedbackSamples[stage];
+      const RingBuffer& input = (stage == 0) ? samples : _feedbackSamples[stage-1];
+      RingBuffer& feedback = _feedbackSamples[stage];
 
-      double b0 = section[0];
-      double b1 = section[1];
-      double b2 = section[2];
-      double a0 = section[3];
-      double a1 = section[4];
-      double a2 = section[5];
+      int stageStart = SECTION_LENGTH * stage;
+      double b0 = _sos[stageStart];
+      double b1 = _sos[stageStart + 1];
+      double b2 = _sos[stageStart + 2];
+      //double a0 = _sos[stageStart + 3]; // (this is always 1.0 in our filters, so this step isn't necessary)
+      double a1 = _sos[stageStart + 4];
+      double a2 = _sos[stageStart + 5];
 
-      auto inputIter = input.begin();
-      double x0 = (inputIter == input.end()) ? 0 : *inputIter++;
-      double x1 = (inputIter == input.end()) ? 0 : *inputIter++;
-      double x2 = (inputIter == input.end()) ? 0 : *inputIter;
-      auto feedbackIter = feedback.begin();
-      double y1 = (feedbackIter == feedback.end()) ? 0 : *feedbackIter++;
-      double y2 = (feedbackIter == feedback.end()) ? 0 : *feedbackIter;
+      double x0 = input[2]; // "last" element of the ring buffer is the most recent
+      double x1 = input[1];
+      double x2 = input[0];
+      double y1 = feedback[2];
+      double y2 = feedback[1];
 
       value = b0*x0 + b1*x1 + b2*x2 - a1*y1 - a2*y2;
-      value /= a0;
+      //value /= a0;
 
-      feedback.push_front(value);
-      if (feedback.size() > MAX_SAMPLES) {
-        feedback.pop_back();
+      if (_debug && stage == 0) {
+        debugVal = value;
       }
+
+      feedback.put(value);
     }
     return value;
   }
@@ -77,96 +103,103 @@ public:
 
 // beep at different frequencies
 void startupSequence() {
-  uint32_t startupCounter = 0;
   // startup sequence
-  while(startupCounter<128) {
-    for(int i=0; i<8 ;i++) {
-      int pulseWidth = 8 - i;
-      if (startupCounter < pulseWidth * 16) {
-        gpio_put(gatePins[i], (startupCounter / pulseWidth) % 2 == 1);
+  int beepCount = 4;
+  int beepLength = 128;
+  delay(beepLength / 2);
+  for (int beep=0; beep<beepCount; beep++) {
+    uint32_t counter = 0;
+    while (counter < beepLength) {
+      for(int i=0; i<8 ;i++) {
+        int pulseWidth = (8 - i) * (beepCount - beep);
+        if (counter < pulseWidth * 16) {
+          gpio_put(gatePins[i], (counter / pulseWidth) % 2 == 1);
+        }
+        else {
+          gpio_put(gatePins[i], 0);
+        }
       }
-      else {
-        gpio_put(gatePins[i], 0);
-      }
+      counter++;
+      delay(1);
     }
-    startupCounter++;
-    delay(1);
+    delay(beepLength / 2);
   }
+  delay(beepLength / 2);
   for(int i=0;i<8;i++) {
     gpio_put(gatePins[i], 0);
   }
 }
 
-std::list<double> samples;
+RingBuffer samples;
 IIRFilter filter1( // lowpass
   {
-    {0.0031501927, -0.0062943005, 0.0031501927, 1.0000000000, -1.9933418629, 0.9933705511},
-    {1.0000000000, -1.9996294537, 1.0000000000, 1.0000000000, -1.9976620670, 0.9977502532}
+    {0.010016186,  -0.019417040,   0.010016186,   1.000000000,  -1.972250810,   0.972941224}
   }
 );
-IIRFilter filter2( // band 1
+IIRFilter filter2( // band 10.055497328,   0.088247099,   0.055497328,   1.000000000,  -0.954431745,   0.714624324
   {
-    {9.3261305e-05, -1.8597351e-04, 9.3261305e-05, 1.0000000e+00, -1.9934158e+00, 9.9373064e-01},
-    {1.0000000e+00, -1.9999831e+00, 1.0000000e+00, 1.0000000e+00, -1.9953481e+00, 9.9596664e-01},
-    {1.0000000e+00, 6.9410512e-09, -9.9999999e-01, 1.0000000e+00, -1.9977824e+00, 9.9794317e-01}
+    {0.010067696,  -0.019138804,   0.010067696,   1.000000000,  -1.974139272,   0.977827957},
+    {1.000000000,  -1.999961581,   1.000000000,   1.000000000,  -1.987165271,   0.988203315}
   }
 );
 
 IIRFilter filter3( // band 2
   {
-    {0.00099611680, -0.00195110019, 0.00099611680, 1.00000000000, -1.98495934402, 0.98764878378},
-    {1.00000000000, -1.98952911463, 1.00000000044, 1.00000000000, -1.98851087182, 0.98991749122},
-    {1.00000000000, -1.99962888502, 0.99999999031, 1.00000000000, -1.99082600702, 0.99472253780},
-    {1.00000000000, -1.99990625580, 1.00000000929, 1.00000000000, -1.99705029659, 0.99807013166}
+    {0.010599523,  -0.017280187,   0.010599523,   1.000000000,  -1.941596936,   0.956177626},
+    {1.000000000,  -1.999846468,   1.000000000,   1.000000000,  -1.972407026,   0.976533780}
   }
 );
 IIRFilter filter4( // band 3
   {
-    {5.3012166e-04, -9.6526901e-04, 5.3012166e-04, 1.0000000e+00, -1.9554125e+00, 9.6522762e-01},
-    {1.0000000e+00, -1.9994654e+00, 1.0000000e+00, 1.0000000e+00, -1.9581968e+00, 9.7755649e-01},
-    {1.0000000e+00, 2.8103075e-12, -1.0000000e+00, 1.0000000e+00, -1.9834120e+00, 9.8847267e-01}
+    {0.012961527,  -0.010771256,   0.012961527,   1.000000000,  -1.857622553,   0.914506880},
+    {1.000000000,  -1.999388156,   1.000000000,   1.000000000,  -1.937225860,   0.953524066}
   }
 );
 IIRFilter filter5( // band 4
   {
-    {0.0011910203, -0.0013760519, 0.0011910203, 1.0000000000,  -1.8747407903,   0.9393966842},
-    {1.0000000000, -1.7485373989, 1.0000000000, 1.0000000000,  -1.8779692592,   0.9738225783},
-    {1.0000000000, -1.9907564881, 1.0000000000, 1.0000000000,  -1.9192283562,   0.9547372628},
-    {1.0000000000, -1.9976795314, 1.0000000000, 1.0000000000,  -1.9619051873,   0.9865586068}
+    {0.022292240,   0.012093023,   0.022292240,   1.000000000,  -1.622586984,   0.838041179},
+    {1.000000000,  -1.997588941,   1.000000000,   1.000000000,  -1.845050693,   0.908480168}
   }
 );
 IIRFilter filter6( // band 5
   {
-    {0.0022903843,   0.0010514855,   0.0022903843,   1.0000000000,  -1.4608185176,   0.9428065629},
-    {1.0000000000,  -0.8717885857,   1.0000000000,   1.0000000000,  -1.5425022405,   0.8665626904},
-    {1.0000000000,  -1.9520900190,   1.0000000000,   1.0000000000,  -1.7162704805,   0.8973147312},
-    {1.0000000000,  -1.9880983461,   1.0000000000,   1.0000000000,  -1.8406864239,   0.9688042492}
+    {0.055497328,   0.088247099,   0.055497328,   1.000000000,  -0.954431745,   0.714624324},
+    {1.000000000,  -1.990921630,   1.000000000,   1.000000000,  -1.581802229,   0.819755786}
   }
 );
 IIRFilter filter7( // band 6
   {
-    {0.0097637011,   0.0169180227,   0.0097637011,   1.0000000000,  -0.0090050166,   0.8991050575},
-    {1.0000000000,   1.0425407387,   1.0000000000,   1.0000000000,  -0.4165277839,   0.7391453658},
-    {1.0000000000,  -1.7950938238,   1.0000000000,   1.0000000000,  -0.9984037310,   0.7735489244},
-    {1.0000000000,  -1.9514599247,   1.0000000000,   1.0000000000,  -1.3582586621,   0.9273517779}
+    {0.1594224,   0.3128679,   0.1594224,   1.0000000,   0.6411885,   0.6061573},
+    {1.0000000,  -1.9717995,   1.0000000,   1.0000000,  -0.8337540,   0.6265015}
   }
 );
 IIRFilter filter8( // highpass
   {
-    {0.0304759,  -0.0229736,   0.0304759,   1.0000000,   0.7278049,   0.5509325},
-    {1.0000000,  -1.3483508,   1.0000000,   1.0000000,   0.2979928,   0.8673432},
-    {1.0000000,  -1.0000000,           0,   1.0000000,   0.5649213,           0}
+    {0.1300065,  -0.2372743,   0.1300065,   1.0000000,   0.8580251,   0.4159908}
   }
 );
 
 double to_double(uint32_t value) {
-  int center = 1 << 11;
-  double d = ((int)value - center) / (double) center;
-  return d;
+  double center = 1 << 11;
+  return (value - center) / center;
 }
 
-bool distort(double value) {
-  return value >= 0.5 || value < -0.75;
+bool distort(const double& value) {
+  return value > 0.1;
+}
+
+void core1_entry() {
+  double output5 = filter5.Process(samples);
+  gpio_put(gatePins[4], distort(output5));
+
+  double output6 = filter6.Process(samples);
+  gpio_put(gatePins[5], distort(output6));
+
+  double  output7 = filter7.Process(samples);
+  gpio_put(gatePins[6], distort(output7));
+
+  double output8 = filter8.Process(samples);
+  gpio_put(gatePins[7], distort(output8));
 }
 
 // audio rate callback- meat of the program goes here
@@ -177,35 +210,24 @@ static bool audioHandler(struct repeating_timer *t) {
 
   //debugVal = input;
 
-  samples.push_front(input);
-  if (samples.size() > MAX_SAMPLES) {
-    samples.pop_back();
-  }
+  samples.put(input);
 
+  // run half of the filters on the other core
+  multicore_reset_core1();
+  multicore_launch_core1(core1_entry);
+
+  // run the other half here
   double output1 = filter1.Process(samples);
-  //debugVal = output1;
   gpio_put(gatePins[0], distort(output1));
 
   double output2 = filter2.Process(samples);
   gpio_put(gatePins[1], distort(output2));
 
-  /*double output3 = filter3.Process(samples);
+  double output3 = filter3.Process(samples);
   gpio_put(gatePins[2], distort(output3));
 
   double output4 = filter4.Process(samples);
   gpio_put(gatePins[3], distort(output4));
-
-  double output5 = filter5.Process(samples);
-  gpio_put(gatePins[4], distort(output5));
-
-  double output6 = filter6.Process(samples);
-  gpio_put(gatePins[5], distort(output6));
-
-  double output7 = filter7.Process(samples);
-  gpio_put(gatePins[6], distort(output7));
-
-  double output8 = filter8.Process(samples);
-  gpio_put(gatePins[7], distort(output8));*/
 
   debugVal = (micros() - start);
 
@@ -215,8 +237,8 @@ static bool audioHandler(struct repeating_timer *t) {
 struct repeating_timer _timer_;
 
 void setup() {
-  // 2x overclock for MAX POWER
-  set_sys_clock_khz(250000, true);
+  // overclock - dialed back a little after adding second core until things seemed stable
+  set_sys_clock_khz(200000, true);
 
   // initialize ADC
   adc_init();
@@ -237,10 +259,10 @@ void setup() {
   add_repeating_timer_us(-TIMER_INTERVAL, audioHandler, NULL, &_timer_);
 
   // init serial debugging
-  Serial.begin(9600);
+  Serial.begin(115200);
 }
 
 void loop() {
-  Serial.println(debugVal);
+  Serial.println(debugVal, 6);
   delay(1);
 }
