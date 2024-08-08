@@ -1,7 +1,7 @@
 # uncertainty-dffb
 
 A distorted fixed filter bank (DFFB) for the Eurorack module
-[Uncertainty](https://github.com/oamodular/uncertainty) by
+[Uncertainty](https://oamodular.org/products/uncertainty) by
 [Olivia Artz Modular](https://github.com/oamodular).
 
 ## About this firmware
@@ -42,15 +42,6 @@ will overlap slightly with each of the adjacent filters.
 For the Octave/Matlab code used to design the filters see
 [filter_design.m](filter_design.m).
 
-## Installing
-
-If you want to install this firmware as-is, you can download the .uf2 file and
-follow the instructions [here](https://github.com/oamodular/uncertainty?tab=readme-ov-file#how-to-reinstall-the-default-firmware).
-
-If you would like to modify the code and run it, you can do so using the Arduino
-IDE, following the instructions
-[here](https://wiki.seeedstudio.com/XIAO-RP2040-with-Arduino/).
-
 ## Use Cases
 
 ### Eight Flavors of Distortion
@@ -80,3 +71,14 @@ the outputs, allows for a wide range of effects, from subtle saturation to
 static-like sounds.  Keep in mind, however, that the outputs are 0-5V signals,
 so inverting/attenuating some of the inputs may be necessary, especially if
 using a DC-coupled mixer.
+
+## Installing
+
+If you want to install this firmware as-is, you can download the .uf2 file (see
+"Releases") and follow the instructions
+[here](https://github.com/oamodular/uncertainty?tab=readme-ov-file#how-to-reinstall-the-default-firmware).
+
+If you would like to modify the code and run it, you can do so using the Arduino
+IDE, following the instructions
+[here](https://wiki.seeedstudio.com/XIAO-RP2040-with-Arduino/).
+
